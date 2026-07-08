@@ -291,8 +291,7 @@ function loadPersistentEmulatorState() {
     if (Number.isInteger(payload.nextResourceCounter) && payload.nextResourceCounter > 0) {
       emulatorResourceCounter = payload.nextResourceCounter;
     }
-  } catch (error) {
-    console.warn('Could not load persisted Coscine emulator state.', error);
+  } catch {
   }
 }
 
@@ -315,8 +314,7 @@ function savePersistentEmulatorState() {
         })),
       }),
     );
-  } catch (error) {
-    console.warn('Could not persist Coscine emulator state.', error);
+  } catch {
   }
 }
 

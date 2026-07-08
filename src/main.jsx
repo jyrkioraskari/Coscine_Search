@@ -416,8 +416,6 @@ function App() {
 
       if (typeof metadataFormRef.current?.validate === 'function') {
         const validationReport = await metadataFormRef.current.validate(false);
-        const serializedMetadata = metadataFormRef.current.serialize();
-        logMetadataDebug('upload validation', serializedMetadata, validationReport);
 
         if (!validationReport?.conforms) {
           setMetadataValid(false);
@@ -428,7 +426,6 @@ function App() {
       }
 
       const serializedMetadata = metadataFormRef.current.serialize();
-      logMetadataDebug('upload metadata', serializedMetadata);
 
       if (!String(serializedMetadata ?? '').trim()) {
         throw new Error('Fill the required Coscine metadata before uploading.');
@@ -898,7 +895,6 @@ function App() {
               <UploadWorkspace
                 isLoadingProfile={isLoadingProfile}
                 isUploading={isUploading}
-                metadataContent={metadataContent}
                 metadataFormRef={metadataFormRef}
                 metadataValid={metadataValid}
                 metadataValidationSummary={metadataValidationSummary}
@@ -1033,12 +1029,6 @@ function SearchView({
 
   return (
     <>
-      <section className="summary-strip">
-        <span>{resources.length} resources</span>
-        <span>{files.length} files in selected resource</span>
-        <span>{filteredFiles.length} visible</span>
-      </section>
-
       <section className="content-grid search-content-grid">
         <aside className="resource-list search-resource-list">
           <div className="search-list-head">
@@ -1132,12 +1122,7 @@ function SearchResourceWorkspace({
   }, [onFilterRdfChange, onRangeFiltersChange, resource.projectId, resource.resourceId]);
 
   useEffect(() => {
-    if (!files.length) {
-      setSelectedFilePath('');
-      return;
-    }
-
-    if (!selectedFilePath || !files.some((file) => searchFilePath(file) === selectedFilePath)) {
+    if (!selectedFilePath && files.length) {
       setSelectedFilePath(searchFilePath(files[0]));
     }
   }, [files, selectedFilePath]);
@@ -1168,6 +1153,7 @@ function SearchResourceWorkspace({
           isLoading={isLoading}
           onRangeFiltersChange={onRangeFiltersChange}
           profile={profile}
+          rawFiles={rawFiles}
           resource={resource}
           selectedLanguage={selectedLanguage}
           selectedFile={selectedFile}
@@ -1249,6 +1235,7 @@ function MetadataFilterForm({
   onFilterRdfChange,
   onRangeFiltersChange,
   profile,
+  rawFiles,
   resource,
   selectedLanguage,
   selectedFile,
@@ -1256,6 +1243,7 @@ function MetadataFilterForm({
   const text = useAppText();
   const normalizedMetadata = normalizeSearchMetadataForForm(selectedFile?.metadata, selectedFile);
   const formKey = `${resource.projectId}:${resource.resourceId}:${profile?.baseUri ?? 'none'}:${searchFilePath(selectedFile)}`;
+  const numericRangeStats = useMemo(() => buildNumericRangeStats(rawFiles), [rawFiles]);
 
   return (
     <section className="form-panel">
@@ -1279,6 +1267,7 @@ function MetadataFilterForm({
       {!isLoading && profile?.shapes ? (
         <SearchShaclFormHost
           formKey={formKey}
+          numericRangeStats={numericRangeStats}
           shapes={profile.shapes}
           selectedLanguage={selectedLanguage}
           values={normalizedMetadata.values}
@@ -1293,6 +1282,7 @@ function MetadataFilterForm({
 
 function SearchShaclFormHost({
   formKey,
+  numericRangeStats,
   onRangeFiltersChange,
   onSerializedChange,
   selectedLanguage,
@@ -1307,6 +1297,7 @@ function SearchShaclFormHost({
     () => collectShapeDescriptionsByPath(sanitizedShapes, selectedLanguage),
     [sanitizedShapes, selectedLanguage],
   );
+  const dirtyFilterPathsRef = useRef(new Set());
 
   useEffect(() => {
     const host = hostRef.current;
@@ -1315,6 +1306,7 @@ function SearchShaclFormHost({
       return undefined;
     }
 
+    dirtyFilterPathsRef.current = new Set();
     host.replaceChildren();
 
     const formElement = document.createElement('shacl-form');
@@ -1335,11 +1327,17 @@ function SearchShaclFormHost({
 
     const updateSerialized = (event) => {
       event?.preventDefault?.();
-      onSerializedChange(collectSearchFormFilterText(formElement));
+      const path = getSearchFilterEventPath(event);
+
+      if (path) {
+        dirtyFilterPathsRef.current.add(path);
+      }
+
+      onSerializedChange(collectSearchFormFilterText(formElement, dirtyFilterPathsRef.current));
     };
     let cleanupLiveFieldListeners = () => {};
     const enhanceForm = () => {
-      enhanceRangeFields(formElement, onRangeFiltersChange);
+      enhanceRangeFields(formElement, onRangeFiltersChange, numericRangeStats);
       attachFieldDescriptionTooltips(formElement, descriptionsByPath);
       cleanupLiveFieldListeners();
       cleanupLiveFieldListeners = attachLiveFieldListeners(formElement, updateSerialized);
@@ -1363,7 +1361,7 @@ function SearchShaclFormHost({
       formElement.removeEventListener('ready', enhanceForm);
       host.replaceChildren();
     };
-  }, [descriptionsByPath, formKey, onRangeFiltersChange, onSerializedChange, rootShapeSubject, sanitizedShapes, selectedLanguage, values, valuesSubject]);
+  }, [descriptionsByPath, formKey, numericRangeStats, onRangeFiltersChange, onSerializedChange, rootShapeSubject, sanitizedShapes, selectedLanguage, values, valuesSubject]);
 
   return <div className="shacl-form-host" ref={hostRef} />;
 }
@@ -1681,18 +1679,43 @@ function parseFieldFilters(filterText) {
   return [];
 }
 
-function collectSearchFormFilterText(formElement) {
+function collectSearchFormFilterText(formElement, dirtyPaths = null) {
   const root = formElement.shadowRoot ?? formElement;
   const values = Array.from(root.querySelectorAll('.property-instance[data-path] .editor'))
     .filter((editor) => !isRangeEditor(editor))
     .map((editor) => {
       const path = editor.closest('.property-instance[data-path]')?.dataset.path;
       const value = getEditorCurrentValue(editor);
-      return path && value !== '' ? { path, value } : null;
+      return path && (!dirtyPaths || dirtyPaths.has(path)) && value !== '' ? { path, value } : null;
     })
     .filter(Boolean);
 
   return JSON.stringify(values);
+}
+
+function getSearchFilterEventPath(event) {
+  if (!event) {
+    return '';
+  }
+
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+  for (const item of path) {
+    if (item?.dataset?.path) {
+      return item.dataset.path;
+    }
+
+    const propertyInstance = item?.closest?.('.property-instance[data-path]');
+    if (propertyInstance?.dataset?.path) {
+      return propertyInstance.dataset.path;
+    }
+  }
+
+  const target = event.target;
+  if (target?.dataset?.path) {
+    return target.dataset.path;
+  }
+
+  return target?.closest?.('.property-instance[data-path]')?.dataset?.path || '';
 }
 
 function applyRangeFilters(files, filters) {
@@ -1717,7 +1740,7 @@ function applyRangeFilters(files, filters) {
   });
 }
 
-function enhanceRangeFields(formElement, onRangeFiltersChange) {
+function enhanceRangeFields(formElement, onRangeFiltersChange, numericRangeStats = new Map()) {
   const root = formElement.shadowRoot ?? formElement;
   ensureRangeFieldStyles(root);
   const editors = Array.from(root.querySelectorAll('.property-instance[data-path] .editor')).filter((editor) =>
@@ -1737,8 +1760,22 @@ function enhanceRangeFields(formElement, onRangeFiltersChange) {
       continue;
     }
 
+    const rangeStats = numericRangeStats.get(path);
+
     editor.dataset.rangeEnhanced = 'true';
     editor.dataset.rangeRole = 'min';
+
+    if (isNumericRangeEditor(editor) && rangeStats?.count > 0 && rangeStats.min <= rangeStats.max) {
+      enhanceNumericSliderRangeField({
+        editor,
+        formElement,
+        max: rangeStats.max,
+        min: rangeStats.min,
+        onRangeFiltersChange,
+        path,
+      });
+      continue;
+    }
 
     const wrapper = document.createElement('div');
     wrapper.className = 'metadata-range-inline';
@@ -1786,6 +1823,104 @@ function enhanceRangeFields(formElement, onRangeFiltersChange) {
   }
 }
 
+function enhanceNumericSliderRangeField({ editor, formElement, max, min, onRangeFiltersChange, path }) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'metadata-slider-filter';
+
+  const originalDisplay = editor.style.display;
+  editor.style.display = 'none';
+  editor.dataset.sliderOriginalDisplay = originalDisplay;
+  editor.parentNode.insertBefore(wrapper, editor);
+  wrapper.appendChild(editor);
+
+  if (min === max) {
+    const onlyValue = document.createElement('div');
+    onlyValue.className = 'metadata-slider-filter__single-value';
+    onlyValue.textContent = `Only one value: ${formatSliderValue(min)}`;
+    wrapper.appendChild(onlyValue);
+    return;
+  }
+
+  const sliderGrid = document.createElement('div');
+  sliderGrid.className = 'metadata-slider-filter__grid';
+
+  const minLabel = document.createElement('label');
+  minLabel.className = 'metadata-slider-filter__label';
+  minLabel.textContent = 'Min';
+
+  const minSlider = document.createElement('input');
+  minSlider.className = 'metadata-slider-filter__input';
+  minSlider.type = 'range';
+  minSlider.min = String(min);
+  minSlider.max = String(max);
+  minSlider.step = getNumericSliderStep(editor);
+  minSlider.value = String(min);
+  minSlider.dataset.path = path;
+  minSlider.dataset.rangeRole = 'min';
+  minSlider.setAttribute('aria-label', 'Minimum value');
+  minLabel.appendChild(minSlider);
+
+  const maxLabel = document.createElement('label');
+  maxLabel.className = 'metadata-slider-filter__label';
+  maxLabel.textContent = 'Max';
+
+  const maxSlider = document.createElement('input');
+  maxSlider.className = 'metadata-slider-filter__input';
+  maxSlider.type = 'range';
+  maxSlider.min = String(min);
+  maxSlider.max = String(max);
+  maxSlider.step = minSlider.step;
+  maxSlider.value = String(max);
+  maxSlider.dataset.path = path;
+  maxSlider.dataset.rangeRole = 'max';
+  maxSlider.setAttribute('aria-label', 'Maximum value');
+  maxLabel.appendChild(maxSlider);
+
+  const valueLine = document.createElement('div');
+  valueLine.className = 'metadata-slider-filter__values';
+
+  wrapper.appendChild(sliderGrid);
+  sliderGrid.appendChild(minLabel);
+  sliderGrid.appendChild(maxLabel);
+  wrapper.appendChild(valueLine);
+
+  const publishRange = () => {
+    let selectedMin = Number(minSlider.value);
+    let selectedMax = Number(maxSlider.value);
+
+    if (selectedMin > selectedMax) {
+      if (document.activeElement === minSlider) {
+        selectedMax = selectedMin;
+        maxSlider.value = String(selectedMax);
+      } else {
+        selectedMin = selectedMax;
+        minSlider.value = String(selectedMin);
+      }
+    }
+
+    valueLine.textContent = `${formatSliderValue(min)} to ${formatSliderValue(max)} | Selected: ${formatSliderValue(selectedMin)} to ${formatSliderValue(selectedMax)}`;
+
+    onRangeFiltersChange((currentFilters) => {
+      const nextFilters = { ...currentFilters };
+
+      if (selectedMin > min || selectedMax < max) {
+        nextFilters[path] = [selectedMin, selectedMax];
+      } else {
+        delete nextFilters[path];
+      }
+
+      return nextFilters;
+    });
+    formElement.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+  };
+
+  minSlider.addEventListener('input', publishRange);
+  minSlider.addEventListener('change', publishRange);
+  maxSlider.addEventListener('input', publishRange);
+  maxSlider.addEventListener('change', publishRange);
+  publishRange();
+}
+
 function ensureRangeFieldStyles(root) {
   if (root.querySelector('#coscine-range-field-styles')) {
     return;
@@ -1816,6 +1951,47 @@ function ensureRangeFieldStyles(root) {
       color: #64748b;
       font-size: 0.75rem;
       font-weight: 700;
+    }
+
+    .metadata-slider-filter {
+      display: grid;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .metadata-slider-filter__grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr);
+    }
+
+    .metadata-slider-filter__label {
+      color: #334155;
+      display: grid;
+      font-size: 0.75rem;
+      font-weight: 800;
+      gap: 6px;
+      text-transform: uppercase;
+    }
+
+    .metadata-slider-filter__input {
+      width: 100%;
+    }
+
+    .metadata-slider-filter__values {
+      color: #475569;
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+
+    .metadata-slider-filter__single-value {
+      background: #fef3c7;
+      border: 1px solid #f59e0b;
+      border-radius: 6px;
+      color: #78350f;
+      font-size: 0.86rem;
+      font-weight: 800;
+      padding: 8px 10px;
     }
   `;
   root.prepend(style);
@@ -1899,6 +2075,16 @@ function getRangeInputType(editor) {
   return inputType;
 }
 
+function getNumericSliderStep(editor) {
+  const step = editor.step || editor.getAttribute?.('step') || '';
+
+  if (step && step !== 'any') {
+    return step;
+  }
+
+  return isIntegerRangeEditor(editor) ? '1' : 'any';
+}
+
 function isRangeEditor(editor) {
   const inputType = getEditorInputType(editor);
   const datatype = getEditorDatatype(editor);
@@ -1909,6 +2095,52 @@ function isRangeEditor(editor) {
       datatype.endsWith(suffix),
     )
   );
+}
+
+function isNumericRangeEditor(editor) {
+  const inputType = getEditorInputType(editor);
+  const datatype = getEditorDatatype(editor);
+
+  return (
+    inputType === 'number' ||
+    ['#integer', '#float', '#double', '#decimal'].some((suffix) => datatype.endsWith(suffix))
+  );
+}
+
+function isIntegerRangeEditor(editor) {
+  return getEditorDatatype(editor).endsWith('#integer') || editor.step === '1' || editor.getAttribute?.('step') === '1';
+}
+
+function buildNumericRangeStats(files) {
+  const stats = new Map();
+
+  for (const file of files ?? []) {
+    const valueMap = extractRangeMetadataValueMap(file.metadata);
+
+    for (const [path, values] of valueMap.entries()) {
+      for (const value of values) {
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+
+        const current = stats.get(path) ?? {
+          count: 0,
+          max: Number.NEGATIVE_INFINITY,
+          min: Number.POSITIVE_INFINITY,
+        };
+        current.count += 1;
+        current.min = Math.min(current.min, value);
+        current.max = Math.max(current.max, value);
+        stats.set(path, current);
+      }
+    }
+  }
+
+  return stats;
+}
+
+function formatSliderValue(value) {
+  return Number.isInteger(value) ? String(value) : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
 function extractTextMetadataValueMap(metadata) {
@@ -1953,7 +2185,7 @@ function extractRangeMetadataValueMap(metadata) {
   const valueMap = new Map();
 
   if (!json) {
-    return valueMap;
+    return extractTurtleRangeMetadataValueMap(metadata);
   }
 
   const nodes = Array.isArray(json) ? json : [json];
@@ -1984,6 +2216,59 @@ function extractRangeMetadataValueMap(metadata) {
   }
 
   return valueMap;
+}
+
+function extractTurtleRangeMetadataValueMap(metadata) {
+  const turtle = extractRdfMetadataString(metadata);
+  const valueMap = new Map();
+
+  if (!turtle) {
+    return valueMap;
+  }
+
+  try {
+    const quads = new Parser({ format: 'text/turtle' }).parse(turtle);
+
+    for (const item of quads) {
+      if (item.object.termType !== 'Literal') {
+        continue;
+      }
+
+      const rangeValue = literalToRangeValue(item.object.value, item.object.datatype?.value ?? '');
+
+      if (Number.isFinite(rangeValue)) {
+        const currentValues = valueMap.get(item.predicate.value) ?? [];
+        currentValues.push(rangeValue);
+        valueMap.set(item.predicate.value, currentValues);
+      }
+    }
+  } catch {
+    return new Map();
+  }
+
+  return valueMap;
+}
+
+function extractRdfMetadataString(metadata) {
+  if (!metadata) {
+    return '';
+  }
+
+  if (typeof metadata === 'string') {
+    return looksLikeRdf(metadata) ? metadata : '';
+  }
+
+  if (typeof metadata === 'object') {
+    for (const key of ['content', 'metadata', 'data', 'value', 'rdf', 'ttl', 'turtle']) {
+      const value = metadata[key];
+
+      if (typeof value === 'string' && looksLikeRdf(value)) {
+        return value;
+      }
+    }
+  }
+
+  return '';
 }
 
 function extractJsonLdMetadata(metadata) {
@@ -2375,7 +2660,6 @@ function SelectedUploadDetails({ file }) {
 function UploadWorkspace({
   isLoadingProfile,
   isUploading,
-  metadataContent,
   metadataFormRef,
   metadataValid,
   metadataValidationSummary,
@@ -2541,31 +2825,14 @@ function UploadWorkspace({
 
           <dl className="upload-facts">
             <div>
-              <dt>{text.environment}</dt>
-              <dd>{serviceLabel}</dd>
-            </div>
-            <div>
               <dt>{text.selectedFile}</dt>
               <dd>{selectedFile?.name || 'None'}</dd>
-            </div>
-            <div>
-              <dt>Size</dt>
-              <dd>{selectedFile ? formatBytes(selectedFile.size) : 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>Metadata</dt>
-              <dd>{metadataContent.trim() ? 'Serialized for last upload attempt' : 'Serialized when uploading'}</dd>
             </div>
           </dl>
 
           <button className="primary-action" type="button" disabled={!canUpload || isUploading} onClick={onUpload}>
             {isUploading ? text.uploading : text.uploadFile}
           </button>
-
-          <details>
-            <summary>Serialized metadata</summary>
-            <pre>{metadataContent || 'Metadata will be serialized by the upload button.'}</pre>
-          </details>
         </section>
       </div>
     </>
@@ -2662,7 +2929,6 @@ function ShaclFormHost({
 
         const serializedMetadata = typeof formElement.serialize === 'function' ? formElement.serialize() : '';
         const isValid = Boolean(validationReport?.conforms && String(serializedMetadata ?? '').trim());
-        logMetadataDebug('metadata validation', serializedMetadata, validationReport);
         onMetadataValidChange(isValid);
         onMetadataChange(isValid ? serializedMetadata : '');
         onMetadataValidationSummaryChange(isValid ? '' : formatValidationReport(formElement, validationReport));
@@ -2827,8 +3093,7 @@ function sanitizeShapesForForm(shapes) {
     });
 
     return serialized || shapes;
-  } catch (error) {
-    console.warn('Could not sanitize SHACL imports.', error);
+  } catch {
     return shapes;
   }
 }
@@ -2878,8 +3143,7 @@ function findRootShapeSubject(shapes) {
         item.object.value === SH_NODE_SHAPE &&
         item.subject.termType === 'NamedNode',
     )?.subject.value || '';
-  } catch (error) {
-    console.warn('Could not find SHACL root shape.', error);
+  } catch {
     return '';
   }
 }
@@ -2908,8 +3172,7 @@ function collectShapeDescriptionsByPath(shapes, preferredLanguage = 'en') {
         descriptionsByPath.set(path, description);
       }
     }
-  } catch (error) {
-    console.warn('Could not read SHACL field descriptions.', error);
+  } catch {
   }
 
   return descriptionsByPath;
@@ -3071,16 +3334,6 @@ function findFieldLabel(element, fallbackPath) {
   return fallbackPath.split(/[\/#]/).filter(Boolean).at(-1) || fallbackPath;
 }
 
-function logMetadataDebug(label, metadataContent, validationReport = null) {
-  console.log(`--- ${label}: serialized metadata begin ---`);
-  console.log(metadataContent || '(empty metadata)');
-  console.log(`--- ${label}: serialized metadata end ---`);
-
-  if (validationReport) {
-    console.log(`--- ${label}: validation report ---`, validationReport);
-  }
-}
-
 function formatValidationReport(formElement, validationReport) {
   const results = collectValidationResults(validationReport);
   const messages = results
@@ -3215,8 +3468,7 @@ function describeShapeRestrictionsForPath(formElement, path) {
     }
 
     return describeShapeRestrictions(formElement, quads, shape, findValidationFieldLabel(formElement, path), path);
-  } catch (error) {
-    console.warn('Could not describe SHACL path restrictions.', error);
+  } catch {
     return '';
   }
 }
@@ -3233,8 +3485,7 @@ function describeShapeRestrictionsFromMessage(formElement, message, fallbackLabe
     const quads = parser.parse(formElement.dataset.shapes);
     const shape = resolveShapeTerm(quads, namedNode(shapeIri));
     return describeShapeRestrictions(formElement, quads, shape, fallbackLabel || findFieldLabelFromPath(shapeIri));
-  } catch (error) {
-    console.warn('Could not describe SHACL shape restrictions.', error);
+  } catch {
     return '';
   }
 }
@@ -3324,8 +3575,7 @@ function describeCurrentShapeIssues(formElement, shapeQuads, shape, sectionPath 
       .filter((item) => item.subject.equals(resolvedShape) && item.predicate.value === SH_PROPERTY)
       .map((item) => describeCurrentPropertyIssue(shapeQuads, dataQuads, sectionSubject, item.object))
       .filter(Boolean);
-  } catch (error) {
-    console.warn('Could not inspect current SHACL shape values.', error);
+  } catch {
     return [];
   }
 }
@@ -3623,8 +3873,7 @@ function saveRememberedFormFields({ contextKey, fieldPaths, fields, metadataCont
       updatedAt: new Date().toISOString(),
     };
     writeFormMemoryStore(store);
-  } catch (storageError) {
-    console.warn('Could not save form field memory.', storageError);
+  } catch {
   }
 }
 
@@ -3687,8 +3936,7 @@ function buildRememberedMetadataContent(contextKey, profile) {
       result = serialized;
     });
     return result;
-  } catch (storageError) {
-    console.warn('Could not load form field memory.', storageError);
+  } catch {
     return '';
   }
 }
@@ -3792,8 +4040,7 @@ function normalizeRememberedMetadataContent(metadataContent, contextKey, profile
     const quads = parser.parse(metadataContent);
     const rootSubject = findRootMetadataSubject(quads);
     return serializeQuadsSync(normalizeRememberedRootSubject(quads, rootSubject, contextKey, profile));
-  } catch (error) {
-    console.warn('Could not normalize remembered metadata content.', error);
+  } catch {
     return metadataContent;
   }
 }
